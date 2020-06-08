@@ -1,4 +1,4 @@
-# Grab Driver
+# Grab Driver - the app for drivers
 GRAB DRIVER - THE APP FOR DRIVERS
 - Be your own boss. Earn more by driving with Grab whenever you want. 
 - Track your earnings easily in the app. 
