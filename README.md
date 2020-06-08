@@ -4,13 +4,13 @@ GRAB DRIVER - THE APP FOR DRIVERS
 - Track your earnings easily in the app. 
 - Get access to exclusive benefits, training and support.
 
-# Live Location Sharing
+# Driver Ride Accept and Live Location Sharing
 The primary feature of Live Location Sharing. Live Location Sharing is useful for:
 
 Workforce productivity apps with messaging and customer support capabilities
 Peer-to-peer marketplaces for cab services
 Ridesharing and carpooling apps like grab
-It helps solve the user's anxiety of “where are you⁉️”.
+It helps solve the user's anxiety of “where are you”.
 
 ![[Watch Demo](https://www.youtube.com/watch?v=Rxtiq3PBpEo)](https://img.youtube.com/vi/Rxtiq3PBpEo/0.jpg)
 
