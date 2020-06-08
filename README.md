@@ -18,6 +18,12 @@ It helps solve the user's anxiety of “where are you⁉️”.
 `OS X 10.15.5+`
 `Xcode 11.5 or above`
 
+
+# Getting Started
+The main goal of grab driver is to provide an easy way to work with location related functionalities (gps tracking, ip tracking, autocomplete of places, geocoding, reverse gecoding...) with ease.
+
+Using this lightweight library you will not need to struggle with GeoFire's delegate and settings anymore; just ask for data and wait for it: Grab driver calibrate GeoFire's settings (distanceFilter, accuracy...) for you based upon running requests.
+
 How Grab Driver Live App uses firebase database API use
 Grab Driver Live App uses Grab Driver firebase API to create and complete trips by using Live realtime database. Live App Backend allows to integrate.
 
