@@ -18,6 +18,12 @@ It helps solve the user's anxiety of “where are you”.
 `OS X 10.15.5+`
 `Xcode 11.5 or above`
 
+# Create a Firebase project
+In the Firebase console, click Add project, then select or enter a Project name. If you have an existing Google Cloud Platform (GCP) project, you can select the project from the dropdown menu to add Firebase resources to that project.
+
+download GoogleService-Info.plist file and add on your project.
+
+![](https://github.com/navneet195/Grab-Shuttle/blob/master/info.png)
 
 # Getting Started
 The main goal of grab driver is to provide an easy way to work with location related functionalities (gps tracking, ip tracking, autocomplete of places, geocoding, reverse gecoding...) with ease.
