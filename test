@@ -1,0 +1,406 @@
+# Databricks notebook source
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+import time
+from datetime import datetime, timezone
+from typing import Any
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.types import ArrayType, MapType, StructType, StructField, StringType, BooleanType
+
+# COMMAND ----------
+SOURCE_TABLE = "prod_builder_strategic_insights.prospect_mine.ext_lake_ext_si_cashmere"
+ROW_LIMIT = 100
+USE_SYNTHETIC_DATA = False
+SHOW_PERSONAL_DATA = False
+ENABLE_GOOGLE_GROUNDING = False
+ENABLE_JEV_FALLBACK = False
+JEV_MODEL = ""
+JEV_CLASSIFIER = None
+EXTERNAL_DATA_TRANSFER_APPROVED = False
+PUBLIC_EVENT_TEXT_REVIEWED = False
+APPROVED_PUBLIC_EVENTS: dict[str, str] = {}
+GOOGLE_SECRET_SCOPE = "cashmere-secrets"
+GOOGLE_SECRET_KEY = "google-gemini-api-key"
+GEMINI_MODEL = "gemini-2.5-flash"
+PROMPT_VERSION = "insurance-life-events-v1"
+MAX_GOOGLE_CALLS = 5
+MAX_RETRIES = 2
+MAX_EVENT_TEXT_LENGTH = 500
+
+EVENT_FIELDS = [
+    "triggers", "personal_recent_news", "experiences", "affiliations",
+    "philanthropy", "notables",
+]
+IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger("cashmere_life_events")
+
+
+def validate_table(value: str) -> str:
+    parts = value.split(".")
+    if len(parts) != 3 or not all(IDENTIFIER.fullmatch(part) for part in parts):
+        raise ValueError("Source must be a valid three-part Unity Catalog identifier")
+    return value
+
+
+validate_table(SOURCE_TABLE)
+if not isinstance(ROW_LIMIT, int) or isinstance(ROW_LIMIT, bool) or ROW_LIMIT <= 0:
+    raise ValueError("ROW_LIMIT must be a positive integer")
+if MAX_GOOGLE_CALLS < 0:
+    raise ValueError("MAX_GOOGLE_CALLS must not be negative")
+
+# COMMAND ----------
+if USE_SYNTHETIC_DATA:
+    source_df = spark.createDataFrame(
+        [
+            ("DEMO001", "Example Person", "Announced appointment as chief executive officer", None),
+            ("DEMO002", "Example Person Two", None, "Published company expansion announcement"),
+            (None, "Example Person Three", "Public appointment announced", None),
+        ],
+        "cashmere_id string, name string, triggers string, personal_recent_news string",
+    )
+else:
+    source_df = spark.read.table(validate_table(SOURCE_TABLE)).limit(ROW_LIMIT)
+
+print("Source schema:")
+source_df.printSchema()
+
+
+def text_column(df: DataFrame, name: str):
+    if name not in df.columns:
+        return F.lit(None).cast("string")
+    value = F.col("`" + name.replace("`", "``") + "`")
+    if isinstance(df.schema[name].dataType, (ArrayType, StructType, MapType)):
+        return F.to_json(value)
+    return value.cast("string")
+
+
+if "cashmere_id" not in source_df.columns:
+    raise ValueError("Required source column cashmere_id is missing")
+
+normalized_df = source_df.withColumn("normalized_person_id", F.trim(text_column(source_df, "cashmere_id")))
+normalized_df = normalized_df.withColumn(
+    "record_valid",
+    F.col("normalized_person_id").isNotNull()
+    & (F.length(F.col("normalized_person_id")) > 0),
+)
+valid_df = normalized_df.filter(F.col("record_valid"))
+invalid_df = normalized_df.filter(~F.col("record_valid"))
+
+available_event_fields = [name for name in EVENT_FIELDS if name in source_df.columns]
+print("Event-bearing fields available:", available_event_fields)
+
+# COMMAND ----------
+def normalize_event_text(value):
+    return F.trim(F.regexp_replace(value, r"\s+", " "))
+
+
+candidate_frames = []
+for field_name in available_event_fields:
+    raw_text = normalize_event_text(text_column(valid_df, field_name))
+    candidate_frames.append(
+        valid_df.select(
+            F.col("normalized_person_id").alias("cashmere_id"),
+            F.lit(field_name).alias("source_field"),
+            raw_text.alias("event_text"),
+        ).filter(
+            F.col("event_text").isNotNull()
+            & (F.length(F.col("event_text")) > 0)
+        )
+    )
+
+if candidate_frames:
+    candidates_df = candidate_frames[0]
+    for frame in candidate_frames[1:]:
+        candidates_df = candidates_df.unionByName(frame)
+    candidates_df = (
+        candidates_df
+        .withColumn("event_text", F.substring("event_text", 1, MAX_EVENT_TEXT_LENGTH))
+        .dropDuplicates(["cashmere_id", "source_field", "event_text"])
+    )
+else:
+    candidates_df = spark.createDataFrame(
+        [], "cashmere_id string, source_field string, event_text string"
+    )
+
+candidates_df = candidates_df.withColumn(
+    "candidate_id",
+    F.sha2(F.concat_ws("|", "cashmere_id", "source_field", "event_text"), 256),
+).withColumn("classification_status", F.lit("NOT_CLASSIFIED"))
+
+# COMMAND ----------
+RESULT_SCHEMA = StructType([
+    StructField("candidate_id", StringType(), False),
+    StructField("cashmere_id", StringType(), True),
+    StructField("source_field", StringType(), True),
+    StructField("event_id", StringType(), True),
+    StructField("event_category", StringType(), True),
+    StructField("event_subcategory", StringType(), True),
+    StructField("event_description", StringType(), True),
+    StructField("event_date", StringType(), True),
+    StructField("insurance_relevance", StringType(), True),
+    StructField("classification_status", StringType(), False),
+    StructField("grounding_status", StringType(), False),
+    StructField("evidence_summary", StringType(), True),
+    StructField("evidence_urls", ArrayType(StringType()), True),
+    StructField("human_review_status", StringType(), False),
+    StructField("outreach_permitted", BooleanType(), False),
+    StructField("model_version", StringType(), True),
+    StructField("prompt_version", StringType(), False),
+    StructField("error_code", StringType(), True),
+    StructField("processed_at", StringType(), False),
+])
+
+
+def category_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")[:80]
+
+
+def parse_json_response(raw: str) -> dict[str, Any]:
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+    result = json.loads(cleaned)
+    if not isinstance(result, dict):
+        raise ValueError("Model response must be a JSON object")
+    return result
+
+
+def extract_sources(response) -> list[str]:
+    sources = []
+    for candidate in getattr(response, "candidates", []) or []:
+        metadata = getattr(candidate, "grounding_metadata", None)
+        for chunk in getattr(metadata, "grounding_chunks", []) or []:
+            web = getattr(chunk, "web", None)
+            uri = getattr(web, "uri", None)
+            if isinstance(uri, str) and uri.startswith("https://") and uri not in sources:
+                sources.append(uri)
+    return sources[:10]
+
+
+def base_result(candidate_id: str, cashmere_id: str, source_field: str) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate_id, "cashmere_id": cashmere_id,
+        "source_field": source_field, "event_id": None,
+        "event_category": None, "event_subcategory": None,
+        "event_description": None, "event_date": None,
+        "insurance_relevance": None, "classification_status": "NOT_CLASSIFIED",
+        "grounding_status": "NOT_REQUESTED", "evidence_summary": None,
+        "evidence_urls": [], "human_review_status": "PENDING",
+        "outreach_permitted": False, "model_version": None,
+        "prompt_version": PROMPT_VERSION, "error_code": None,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def classify_public_event(client, public_text: str) -> tuple[dict[str, Any], list[str]]:
+    from google.genai import types
+
+    prompt = (
+        "Classify the following explicitly approved public event statement for "
+        "insurance-related life-event review. Discover a concise reusable category "
+        "and subcategory from the evidence; do not invent facts, infer protected or "
+        "sensitive attributes, determine insurance eligibility, or recommend outreach. "
+        "Distinguish an actual dated event from a generic biography or speculation. "
+        "Use Google Search grounding for independent public evidence. "
+        "Return ONLY a JSON object with keys: is_event (boolean), category (string or null), "
+        "subcategory (string or null), description (string or null), "
+        "event_date (ISO date string or null), insurance_relevance "
+        "(relevant, unclear, or not_relevant), evidence_summary (string or null). "
+        "Use null where evidence is insufficient. "
+        f"Public statement: {public_text}"
+    )
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        ),
+    )
+    return parse_json_response(response.text or ""), extract_sources(response)
+
+# COMMAND ----------
+GOOGLE_ENABLED = (
+    ENABLE_GOOGLE_GROUNDING
+    and EXTERNAL_DATA_TRANSFER_APPROVED
+    and PUBLIC_EVENT_TEXT_REVIEWED
+)
+if ENABLE_GOOGLE_GROUNDING and not GOOGLE_ENABLED:
+    print("Gemini disabled: external transfer approval and public-text review are required")
+
+JEV_ENABLED = (ENABLE_JEV_FALLBACK and callable(JEV_CLASSIFIER) and EXTERNAL_DATA_TRANSFER_APPROVED and PUBLIC_EVENT_TEXT_REVIEWED)
+MODEL_PROCESSING_ENABLED = GOOGLE_ENABLED or JEV_ENABLED
+classification_rows: list[dict[str, Any]] = []
+if MODEL_PROCESSING_ENABLED:
+    client = None
+    if GOOGLE_ENABLED:
+        try:
+            from google import genai
+            api_key = dbutils.secrets.get(scope=GOOGLE_SECRET_SCOPE, key=GOOGLE_SECRET_KEY)
+            if api_key:
+                client = genai.Client(api_key=api_key)
+        except Exception as exc:
+            logger.warning("Gemini unavailable (%s); trying configured fallback", type(exc).__name__)
+    rows_to_classify = candidates_df.orderBy("candidate_id").limit(ROW_LIMIT * max(1, len(available_event_fields))).collect()
+    calls_made = 0
+    for row in rows_to_classify:
+        result = base_result(row.candidate_id, row.cashmere_id, row.source_field)
+        public_text = row.event_text if USE_SYNTHETIC_DATA else APPROVED_PUBLIC_EVENTS.get(row.candidate_id)
+        if not public_text or calls_made >= MAX_GOOGLE_CALLS:
+            result["classification_status"] = "NOT_CLASSIFIED"
+            classification_rows.append(result)
+            continue
+        calls_made += 1
+        for attempt in range(MAX_RETRIES + 1):
+            if client is None:
+                break
+            try:
+                prediction, urls = classify_public_event(client, public_text)
+                is_event = prediction.get("is_event") is True
+                category = prediction.get("category")
+                if is_event and isinstance(category, str) and category_slug(category):
+                    result["event_category"] = category.strip()[:100]
+                    result["event_subcategory"] = str(prediction.get("subcategory") or "")[:100] or None
+                    result["event_description"] = str(prediction.get("description") or "")[:500] or None
+                    result["event_id"] = hashlib.sha256(
+                        (row.candidate_id + "|" + category_slug(category)).encode()
+                    ).hexdigest()
+                    date = prediction.get("event_date")
+                    if isinstance(date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+                        try:
+                            result["event_date"] = datetime.strptime(date, "%Y-%m-%d").date().isoformat()
+                        except ValueError:
+                            pass
+                    relevance = prediction.get("insurance_relevance")
+                    result["insurance_relevance"] = (
+                        relevance if relevance in {"relevant", "unclear", "not_relevant"} else "unclear"
+                    )
+                    result["classification_status"] = "CANDIDATE_UNVERIFIED"
+                else:
+                    result["classification_status"] = "UNCLASSIFIED"
+                result["evidence_summary"] = str(prediction.get("evidence_summary") or "")[:500] or None
+                result["evidence_urls"] = urls
+                result["grounding_status"] = "SOURCES_RETURNED_UNVERIFIED" if urls else "NO_GROUNDING_SOURCES"
+                result["model_version"] = GEMINI_MODEL
+                break
+            except Exception as exc:
+                result["classification_status"] = "ERROR_REVIEW_REQUIRED"
+                result["error_code"] = type(exc).__name__
+                if attempt < MAX_RETRIES:
+                    time.sleep(min(2 ** attempt, 4))
+        if result["classification_status"] in {"NOT_CLASSIFIED", "ERROR_REVIEW_REQUIRED"}:
+            if JEV_ENABLED:
+                try:
+                    prediction = JEV_CLASSIFIER(public_text, JEV_MODEL)
+                    if not isinstance(prediction, dict):
+                        raise ValueError("Jev adapter must return a dictionary")
+                    category = prediction.get("category")
+                    if prediction.get("is_event") is True and isinstance(category, str) and category_slug(category):
+                        result["event_category"] = category.strip()[:100]
+                        result["event_subcategory"] = str(prediction.get("subcategory") or "")[:100] or None
+                        result["event_description"] = str(prediction.get("description") or "")[:500] or None
+                        result["event_id"] = hashlib.sha256((row.candidate_id + "|" + category_slug(category)).encode()).hexdigest()
+                        result["classification_status"] = "CANDIDATE_UNVERIFIED"
+                        result["model_version"] = JEV_MODEL
+                    else:
+                        result["classification_status"] = "NOT_CLASSIFIED"
+                except Exception as exc:
+                    result["error_code"] = type(exc).__name__
+                    result["classification_status"] = "NOT_CLASSIFIED"
+            else:
+                result["classification_status"] = "NOT_CLASSIFIED"
+        classification_rows.append(result)
+
+if MODEL_PROCESSING_ENABLED:
+    classification_df = spark.createDataFrame(classification_rows, schema=RESULT_SCHEMA)
+else:
+    classification_df = candidates_df.select(
+        "candidate_id", "cashmere_id", "source_field",
+        F.lit(None).cast("string").alias("event_id"),
+        F.lit(None).cast("string").alias("event_category"),
+        F.lit(None).cast("string").alias("event_subcategory"),
+        F.lit(None).cast("string").alias("event_description"),
+        F.lit(None).cast("string").alias("event_date"),
+        F.lit(None).cast("string").alias("insurance_relevance"),
+        F.lit("NOT_CLASSIFIED").alias("classification_status"),
+        F.lit("NOT_REQUESTED").alias("grounding_status"),
+        F.lit(None).cast("string").alias("evidence_summary"),
+        F.array().cast("array<string>").alias("evidence_urls"),
+        F.lit("PENDING").alias("human_review_status"),
+        F.lit(False).alias("outreach_permitted"),
+        F.lit(None).cast("string").alias("model_version"),
+        F.lit(PROMPT_VERSION).alias("prompt_version"),
+        F.lit(None).cast("string").alias("error_code"),
+        F.current_timestamp().cast("string").alias("processed_at"),
+    )
+
+# COMMAND ----------
+metrics = {
+    "source_rows": source_df.count(),
+    "valid_rows": valid_df.count(),
+    "invalid_rows": invalid_df.count(),
+    "candidate_statements": candidates_df.count(),
+    "google_grounding_enabled": GOOGLE_ENABLED and client is not None,
+    "jev_fallback_enabled": JEV_ENABLED,
+    "classified_output_rows": classification_df.count(),
+    "not_classified_rows": classification_df.filter(F.col("classification_status") == "NOT_CLASSIFIED").count(),
+    "human_review_pending": classification_df.filter(F.col("human_review_status") == "PENDING").count(),
+    "outreach_permitted_rows": classification_df.filter(F.col("outreach_permitted") == F.lit(True)).count(),
+    "grounding_sources_returned": classification_df.filter(F.size("evidence_urls") > 0).count(),
+    "classification_error_rows": classification_df.filter(F.col("error_code").isNotNull()).count(),
+}
+print("\n=== CASHMERE PIPELINE METRICS ===")
+for key, value in metrics.items():
+    print(f"{key}: {value}")
+
+if not MODEL_PROCESSING_ENABLED:
+    print("No model configured: classification_status is NOT_CLASSIFIED; no external calls made")
+elif client is None:
+    print("Gemini unavailable; using approved Jev fallback when configured")
+
+print("\n=== CLASSIFICATION STATUS ===")
+display(classification_df.groupBy("classification_status").count().orderBy("classification_status"))
+
+print("\n=== HUMAN REVIEW STATUS ===")
+display(classification_df.groupBy("human_review_status").count().orderBy("human_review_status"))
+
+print("\n=== OUTREACH PERMISSION ===")
+display(classification_df.groupBy("outreach_permitted").count().orderBy("outreach_permitted"))
+
+print("\n=== GROUNDING STATUS ===")
+display(classification_df.groupBy("grounding_status").count().orderBy("grounding_status"))
+
+print("\n=== INSURANCE RELEVANCE ===")
+display(classification_df.groupBy("insurance_relevance").count().orderBy("insurance_relevance"))
+
+print("\n=== EVENT SOURCES ===")
+display(candidates_df.groupBy("source_field", "classification_status").count().orderBy("source_field"))
+
+print("\n=== REVIEW QUEUE (IDENTIFIERS MASKED) ===")
+review_columns = [
+    "candidate_id", "source_field", "event_id", "event_category",
+    "event_subcategory", "event_date", "insurance_relevance",
+    "classification_status", "grounding_status", "evidence_urls",
+    "human_review_status", "outreach_permitted", "model_version",
+    "prompt_version", "error_code", "processed_at",
+]
+review_df = classification_df.select(*review_columns)
+display(review_df.orderBy("candidate_id").limit(100))
+
+if SHOW_PERSONAL_DATA:
+    print("\n=== AUTHORIZED RECORD-LEVEL REVIEW ===")
+    display(classification_df.orderBy("candidate_id").limit(100))
+    display(candidates_df.orderBy("candidate_id").limit(100))
+
+# COMMAND ----------
+assert metrics["source_rows"] == metrics["valid_rows"] + metrics["invalid_rows"]
+assert classification_df.filter(F.col("outreach_permitted") == F.lit(True)).count() == 0
+assert classification_df.filter(F.col("human_review_status") != "PENDING").count() == 0
+assert category_slug("Career  Change!") == "career_change"
+assert parse_json_response('{"is_event": false}')["is_event"] is False
+print("Smoke tests passed. No Databricks tables or files were modified.")
